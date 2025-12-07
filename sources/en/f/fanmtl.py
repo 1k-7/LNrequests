@@ -15,7 +15,7 @@ class FanMTLCrawler(Crawler):
 
     def initialize(self):
         # 1. REDUCE THREADS: 8 is too high for a protected site, keeps RAM lower.
-        self.init_executor(2)
+        self.init_executor(5)
         
         # 2. THE FIX: Overwrite the default cloudscraper with a basic Requests Session
         # This prevents it from launching Node.js/JS engines in the background.
