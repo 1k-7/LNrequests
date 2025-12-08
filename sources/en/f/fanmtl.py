@@ -15,7 +15,7 @@ class FanMTLCrawler(Crawler):
 
     def initialize(self):
         # 1. REDUCE THREADS: 8 is too high for a protected site, keeps RAM lower.
-        self.init_executor(5)
+        self.init_executor(3)
         
         # 2. THE FIX: Overwrite the default cloudscraper with a basic Requests Session
         # This prevents it from launching Node.js/JS engines in the background.
@@ -23,7 +23,7 @@ class FanMTLCrawler(Crawler):
         
         # 3. Add standard headers so you don't look like a bot
         self.scraper.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
         })
 
