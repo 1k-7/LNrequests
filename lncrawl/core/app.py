@@ -1,6 +1,7 @@
-# REMOVED: import atexit
+# lncrawl/core/app.py
 import logging
 import os
+import json # <--- ADDED
 from pathlib import Path
 from threading import Event
 from typing import Dict, List, Optional, Tuple
@@ -16,7 +17,7 @@ from ..core.sources import crawler_list, prepare_crawler
 from ..models import Chapter, CombinedSearchResult, OutputFormat
 from .browser import Browser
 from .crawler import Crawler
-from .download_chapters import fetch_chapter_body
+from .download_chapters import fetch_chapter_body, get_chapter_file # <--- MODIFIED
 from .download_images import fetch_chapter_images
 from .exeptions import ScraperErrorGroup
 from .metadata import save_metadata
@@ -40,6 +41,7 @@ class App:
         self.output_path = C.DEFAULT_OUTPUT_PATH
         self.pack_by_volume = False
         self.chapters: List[Chapter] = []
+        self.novel_status: str = "PENDING" # <--- ADDED: PENDING, HALTED, FAILED, COMPLETED
         self.book_cover: Optional[str] = None
         self.output_formats: Dict[OutputFormat, bool] = {}
         self.generated_books: Dict[OutputFormat, List[str]] = {}
@@ -83,6 +85,7 @@ class App:
             self.crawler.close()
             self.crawler = None
         self.chapters = []
+        self.novel_status = "PENDING"
         self.login_data = None
         self.book_cover = None
         self.search_progress = 0
@@ -132,10 +135,12 @@ class App:
         except ScraperErrorGroup as e:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.exception("Failed to get response: %s", e)
-            with Browser() as browser:
-                browser.visit(url)
-                browser.wait("body")
-                reader = Document(browser.html)
+            # Removed browser fallback to prevent accidental memory leaks
+            # with Browser() as browser:
+            #     browser.visit(url)
+            #     browser.wait("body")
+            #     reader = Document(browser.html)
+            raise e
         return reader.short_title()
 
     def search_novel(self):
@@ -223,18 +228,43 @@ class App:
             raise LNException("Output path is not defined")
         if not Path(self.output_path).is_dir():
             raise LNException(
-                f"Output path does not exists: ({self.output_path})")
+                f"Output path does not exists: ({self.output_path})"
+            )
+        
+        self.novel_status = "PENDING" # Reset status at start
 
         save_metadata(self)
         if signal.is_set():
             return  # canceled
 
-        yield from fetch_chapter_body(self, signal)
+        # 1. FETCH CHAPTER BODY
+        for _ in fetch_chapter_body(self, signal):
+            if self.novel_status == "HALTED": # Check status signal from download threads
+                return # Stop the generator
+            yield
+
+        # 2. INTEGRITY CHECK: All chapters must be successful
+        # (FIXED to prevent crash if 'c' is an object instead of dict and vice versa)
+        failed_chapters = [c for c in self.chapters if not (getattr(c, 'success', False) if not isinstance(c, dict) else c.get('success', False))]
+        
+        if failed_chapters:
+            if self.novel_status != "HALTED":
+                self.novel_status = "FAILED"
+            
+            logger.error(
+                "Download failed: %d/%d chapters were not fetched properly.", 
+                len(failed_chapters), 
+                len(self.chapters)
+            )
+            logger.warning("Skipping binding and image download due to failed chapters.")
+            return # Stop the generator (Prevents execution of steps 3 & 4)
+
+        self.novel_status = "COMPLETED"
         save_metadata(self)
         if signal.is_set():
             return  # canceled
 
-        yield from fetch_chapter_images(self, signal)
+        yield from fetch_chapter_images(self, signal) # Only runs if COMPLETED
         save_metadata(self, True)
         if signal.is_set():
             return  # canceled
@@ -249,33 +279,87 @@ class App:
         Requires: crawler, chapters, output_path, pack_by_volume, book_cover,
         output_formats
         """
+        if self.novel_status != "COMPLETED":
+            logger.warning("Skipping bind_books: Novel status is %s", self.novel_status)
+            return
+
         logger.info("Processing data for binding")
         assert self.crawler
 
+        # --- FIX ASYNC OUT-OF-ORDER APPENDS ---
+        def get_chap_id(x):
+            val = x.get('id') if isinstance(x, dict) else getattr(x, 'id', 0)
+            try: return float(val)
+            except: return 0
+            
+        self.chapters.sort(key=get_chap_id)
+        # --------------------------------------------------
+
+        # 1. Group chapters (Same as before)
         data = {}
         if self.pack_by_volume:
             for vol in self.crawler.volumes:
-                # filename_suffix = 'Volume %d' % vol['id']
-                filename_suffix = "Chapter %d-%d" % (
-                    vol["start_chapter"],
-                    vol["final_chapter"],
-                )
+                # Ensure we handle vol if it behaves like a dict or an object
+                vol_id = vol.get('id') if isinstance(vol, dict) else getattr(vol, 'id')
+                filename_suffix = "Volume %d" % vol_id
                 data[filename_suffix] = [
-                    x
-                    for x in self.chapters
-                    if x["volume"] == vol["id"] and len(x["body"]) > 0
+                    x for x in self.chapters if (x.get("volume") if isinstance(x, dict) else getattr(x, "volume")) == vol_id
                 ]
         else:
-            # FIX: Check if chapters exist to prevent IndexError
             if not self.chapters:
                 return
+            
+            # Using the helper to safely get the IDs in case it's dict or object
+            first_id = get_chap_id(self.chapters[0])
+            last_id = get_chap_id(self.chapters[-1])
+            data[f"c{int(first_id)}-{int(last_id)}"] = self.chapters
 
-            first_id = self.chapters[0]["id"]
-            last_id = self.chapters[-1]["id"]
-            data[f"c{first_id}-{last_id}"] = self.chapters
+        # 2. Process each group (Volume/Book) one by one
+        for vol_name, chapters in data.items():
+            if not chapters:
+                continue
+                
+            # --- RELOAD: Load content from disk into RAM ---
+            logger.info("Loading %d chapters for %s...", len(chapters), vol_name)
+            for chapter in chapters:
+                # Support dictionary vs object attribute retrieval safely
+                chapter_body = chapter.get('body') if isinstance(chapter, dict) else getattr(chapter, 'body', None)
+                chapter_id = chapter.get('id') if isinstance(chapter, dict) else getattr(chapter, 'id', None)
 
-        for fmt in generate_books(self, data):
-            save_metadata(self)
+                if chapter_body: 
+                    continue
+                try:
+                    file_path = get_chapter_file(chapter, self.output_path, self.pack_by_volume)
+                    if os.path.exists(file_path):
+                        with open(file_path, 'r', encoding="utf-8") as f:
+                            saved_data = json.load(f)
+                            # Ensure we use saved body, even if it's the placeholder
+                            if isinstance(chapter, dict):
+                                chapter['body'] = saved_data.get('body', '')
+                            else:
+                                chapter.body = saved_data.get('body', '') 
+                except Exception as e:
+                    logger.error(f"Failed to reload chapter {chapter_id}: {e}")
+
+            # --- BIND: Generate the files (EPUB, etc.) ---
+            for fmt in generate_books(self, {vol_name: chapters}):
+                save_metadata(self)
+                if signal.is_set():
+                    break
+                yield fmt, self.generated_archives[fmt]
+
+            # --- UNLOAD: Clear RAM immediately ---
+            for chapter in chapters:
+                if isinstance(chapter, dict):
+                    chapter['body'] = None
+                else:
+                    chapter.body = None
+            
+            import gc
+            gc.collect()
+
             if signal.is_set():
                 break
-            yield fmt, self.generated_archives[fmt]
+
+        if self.crawler and self.can_do("logout"):
+            self.crawler.logout()

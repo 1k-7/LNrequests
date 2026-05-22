@@ -11,11 +11,20 @@ def __format_title(text):
     return re.sub(r"\s+", " ", str(text)).strip().title()
 
 
+def _get_id_safely(x):
+    """Helper to safely extract and parse an ID into a number"""
+    val = x.get('id') if isinstance(x, dict) else getattr(x, 'id', 0)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return 0
+
+
 def __format_volume(crawler: Crawler, vol_id_map: Dict[int, int]):
     if crawler.volumes:
         crawler.volumes = [
             vol if isinstance(vol, Volume) else Volume(**vol)
-            for vol in sorted(crawler.volumes, key=lambda x: x.get("id"))
+            for vol in sorted(crawler.volumes, key=_get_id_safely)
         ]
     else:
         for i in range(math.ceil(len(crawler.chapters) / 100)):
@@ -34,7 +43,7 @@ def __format_volume(crawler: Crawler, vol_id_map: Dict[int, int]):
 def __format_chapters(crawler: Crawler, vol_id_map: Dict[int, int]):
     crawler.chapters = [
         chap if isinstance(chap, Chapter) else Chapter(**chap)
-        for chap in sorted(crawler.chapters, key=lambda x: x.get("id"))
+        for chap in sorted(crawler.chapters, key=_get_id_safely)
     ]
     for index, item in enumerate(crawler.chapters):
         if not isinstance(item, Chapter):
@@ -48,7 +57,7 @@ def __format_chapters(crawler: Crawler, vol_id_map: Dict[int, int]):
         else:
             vol_index = vol_id_map.get(index // 100 + 1, -1)
         assert vol_index >= 0 and vol_index < len(crawler.volumes), \
-            f"Unknown volume for chapter {item['id']}"
+            f"Unknown volume for chapter {item.id}"
 
         volume = crawler.volumes[vol_index]
         item.volume = volume.id
@@ -68,4 +77,4 @@ def format_novel(crawler: Crawler):
     vol_id_map: Dict[int, int] = {}
     __format_volume(crawler, vol_id_map)
     __format_chapters(crawler, vol_id_map)
-    crawler.volumes = [x for x in crawler.volumes if x["chapter_count"] > 0]
+    crawler.volumes = [x for x in crawler.volumes if x.chapter_count > 0]
